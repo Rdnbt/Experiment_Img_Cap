@@ -1,86 +1,124 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from transformers import BertModel
-from torchvision.models import inception_v3, Inception_V3_Weights
+from torchvision.models import Inception_V3_Weights
+
+# Assuming BERT's embedding size is 768. Verify and adjust if needed.
+BERT_EMBEDDING_SIZE = 768
+BERT_VOCAB_SIZE = 32000  # Mongolian BERT's vocabulary size
+
 
 class EncoderCNN(nn.Module):
-    def __init__(self, embed_size):
+    def __init__(self, train_CNN=False, embed_size=BERT_EMBEDDING_SIZE):
         super(EncoderCNN, self).__init__()
-        self.inception = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1)
-        self.inception.fc = nn.Linear(self.inception.fc.in_features, embed_size)
+        self.train_CNN = train_CNN
+        self.inception = models.inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1,
+                                             transform_input=False)
+        self.inception.fc = nn.Linear(self.inception.fc.in_features,
+                                      embed_size)
+        self.inception.AuxLogits = None
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.5)
 
     def forward(self, images):
-        # Get the main output from the Inception model
         features = self.inception(images)
+        if isinstance(features, tuple):
+            features = features[0] # Extract the main output
         return self.dropout(self.relu(features))
 
 
 class DecoderRNN(nn.Module):
-    def __init__(self, embed_size, hidden_size, num_layers):
+    def __init__(self, hidden_size, num_layers, embed_size=BERT_EMBEDDING_SIZE, vocab_size=BERT_VOCAB_SIZE):
         super(DecoderRNN, self).__init__()
-        self.lstm = nn.LSTM(embed_size, hidden_size, num_layers, batch_first=True)
-        self.linear = nn.Linear(hidden_size, 32000)  # Make sure this matches the vocab size
+        self.embed = nn.Embedding(vocab_size, embed_size)  # First vocab_size, then embed_size
+        self.lstm = nn.LSTM(embed_size, hidden_size, num_layers)
+        self.linear = nn.Linear(hidden_size, vocab_size)
         self.dropout = nn.Dropout(0.5)
-        self.features_to_hidden = nn.Linear(embed_size, hidden_size)  # Linear layer to adapt feature size
 
     def forward(self, features, captions):
-        self.lstm.flatten_parameters()
-        # Transform features to the correct hidden state size
-        features = self.features_to_hidden(features)
+        # Check captions input just before embedding
+        #print("Captions input to embed:", captions)  # Add this line
 
-        # Now features should have the same size as the hidden size expected by the LSTM
-        hidden_state = features.unsqueeze(0).expand(self.lstm.num_layers, *features.size())
-        cell_state = torch.zeros_like(hidden_state)
+        # Embed the captions
+        embeddings = self.embed(captions)  # [batch size, caption length, embed size]
+        #print("Embeddings shape:", embeddings.shape)
 
-        # Forward pass through LSTM
-        hiddens, _ = self.lstm(captions, (hidden_state, cell_state))
+        # Check the shape of the features tensor
+        #print("Features shape before unsqueeze:", features.shape)
+        features = features.unsqueeze(1)#.repeat(1, captions.size(1), 1)  # [batch size, 1, embed size]
+        #print("Features shape after unsqueeze:", features.shape)
 
-        # Pass the output of the LSTM to the linear layer
-        outputs = self.dropout(self.linear(hiddens))
+        # Ensure that features and captions have the same batch size
+        batch_size = features.size(0)
+        captions = captions[:batch_size, :]
+
+        # Concatenate the image features and embeddings
+        # Now combined should be [batch size, 1 + caption length, embed size]
+        combined = torch.cat((features, embeddings), dim=1)
+        print("Combined shape:", combined.shape)
+
+        # Pass the combined tensor to the LSTM
+        lstm_out, _ = self.lstm(combined)
+        print("LSTM output shape:", lstm_out.shape)
+
+        # Take all LSTM outputs except the first one which corresponds to the image feature
+        lstm_out = lstm_out[:, 1:, :]  # [batch size, caption length, hidden size]
+
+        # Dropout and linear layer
+        outputs = self.dropout(lstm_out)
+        outputs = self.linear(outputs)
+        print("Outputs shape:", outputs.shape)
+
         return outputs
+
 
 
 class CNNtoRNN(nn.Module):
-    def __init__(self, embed_size, hidden_size, num_layers):
+    def __init__(self, hidden_size, num_layers, embed_size=768, vocab_size=32000, device="cpu"):
         super(CNNtoRNN, self).__init__()
+        self.device = device
         self.encoderCNN = EncoderCNN(embed_size)
-        self.decoderRNN = DecoderRNN(embed_size, hidden_size, num_layers)
-        self.bert = BertModel.from_pretrained('tugstugi/bert-base-mongolian-cased')
+        self.decoderRNN = DecoderRNN(hidden_size, num_layers, embed_size, vocab_size)
 
-    def forward(self, images, captions, attention_mask=None):
+    def forward(self, images, captions):
         features = self.encoderCNN(images)
+        #print("Image features shape:", features.shape)
+        #print("Captions shape:", captions.shape)
 
-        # Get the BERT embeddings for the captions
-        bert_output = self.bert(captions, attention_mask=attention_mask).last_hidden_state
-
-        # Pass both the features and the BERT embeddings to the DecoderRNN
-        outputs = self.decoderRNN(features, bert_output)
+        outputs = self.decoderRNN(features, captions)
         return outputs
 
-    def caption_image(self, image, tokenizer, max_length=50):
+    def caption_image(self, image, vocabulary, max_length=50):
         result_caption = []
 
         with torch.no_grad():
-            features = self.encoderCNN(image).unsqueeze(0)
-            states = None  # LSTM states are initially None
+            x = self.encoderCNN(image).unsqueeze(0)
+            states = None
 
             for _ in range(max_length):
-                hiddens, states = self.decoderRNN.lstm(features, states)
+                hiddens, states = self.decoderRNN.lstm(x, states)
                 output = self.decoderRNN.linear(hiddens.squeeze(0))
                 predicted = output.argmax(1)
-                predicted_word_idx = predicted.item()
-                result_caption.append(predicted_word_idx)
+                predicted_item = predicted.item()
 
-                # Prepare the next input token for the LSTM
-                next_token = torch.tensor([[predicted_word_idx]], device=image.device)
-                bert_output = self.bert(next_token).last_hidden_state
-                features = bert_output
+                # Check if the predicted token ID is in the vocabulary
+                if predicted_item in vocabulary.itos:
+                    token = vocabulary.itos[predicted_item]
+                else:
+                    token = "<UNK>"  # Use a default unknown token
 
-                if predicted_word_idx == tokenizer.eos_token_id:
+                result_caption.append(token)
+
+                # Convert the token back to an index for the next prediction step
+                # Handle the case where the token might be unknown
+                if token in vocabulary.stoi:
+                    next_input = vocabulary.stoi[token]
+                else:
+                    next_input = vocabulary.stoi["<UNK>"]
+
+                x = self.decoderRNN.embed(torch.tensor([next_input], device=self.device)).unsqueeze(0)
+
+                if token == "<EOS>":
                     break
 
-        return [tokenizer.decode([idx], skip_special_tokens=True) for idx in result_caption]
-
+        return result_caption
